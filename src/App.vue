@@ -10,10 +10,12 @@ import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { onAuthStateChanged, signOut } from 'firebase/auth'
 import { doc, query, where, orderBy, onSnapshot, addDoc, updateDoc, deleteDoc,
          writeBatch, serverTimestamp } from 'firebase/firestore'
-import { db, todosCol, auth } from './firebase'
+import { db, todosCol, auth, model} from './firebase'
 import LoginForm from './components/LoginForm.vue'
 import TodoItem from './components/TodoItem.vue'
 import TodoFilters from './components/TodoFilters.vue'
+
+
 
 const user = ref(null)          // the real Firebase user, or null
 const authReady = ref(false)    // false until Firebase knows whether you're signed in
@@ -36,6 +38,9 @@ const newImportant = ref(false)
 const inputEl = ref(null)
 
 const filter = ref('all')
+const summary = ref('')
+const summarizing = ref(false)
+const summaryError = ref('')
 
 const remaining = computed(() => todos.value.filter((t) => !t.done).length)
 const doneCount = computed(() => todos.value.length - remaining.value)
@@ -66,6 +71,7 @@ onMounted(() => {
 watch(user, (u) => {
   if (stopTodos) stopTodos()
   todos.value = []
+  summary.value = ''
   if (!u) return
 
   const q = query(todosCol, where('uid', '==', u.uid), orderBy('createdAt'))
@@ -102,6 +108,38 @@ function addTodo() {
   newImportant.value = false
 
   addDoc(todosCol, newTodo)
+}
+
+async function summarize() {
+  if (todos.value.length === 0) {
+    summary.value = 'Your list is empty. Add a task first!'
+    return
+  }
+
+  // One task per line, with (important) for important ones
+  const format = (t) => `- ${t.text}${t.important ? ' (important)' : ''}`
+  const openTodos = todos.value.filter((t) => !t.done).map(format)
+  const doneTodos = todos.value.filter((t) => t.done).map(format)
+
+  const prompt = `Summarize this todo list in 2-3 sentences.
+Open todos:
+${openTodos.length > 0 ? openTodos.join('\n') : 'none'}
+Completed todos:
+${doneTodos.length > 0 ? doneTodos.join('\n') : 'none'}
+Total: ${todos.value.length} todos (${openTodos.length} open, ${doneTodos.length} done)
+Tasks marked (important) are important. Mention them first.
+Provide a brief, friendly summary. Plain text only, no markdown.`
+
+  summaryError.value = ''
+  summarizing.value = true
+  try {
+    const result = await model.generateContent(prompt)
+    summary.value = result.response.text()
+  } catch (err) {
+    summaryError.value = 'Could not summarize: ' + err.message
+  } finally {
+    summarizing.value = false
+  }
 }
 
 function toggleTodo(id) {
@@ -178,7 +216,13 @@ function clearDone() {
           />
         </ul>
         <p v-else class="empty">Nothing here for "{{ filter }}".</p>
-
+        <div class="summary">
+  <button class="primary" :disabled="summarizing" @click="summarize">
+    {{ summarizing ? 'Thinking…' : '✨ Summarize my list' }}
+  </button>
+  <p v-if="summary" class="tips">{{ summary }}</p>
+  <p v-if="summaryError" class="msg error">{{ summaryError }}</p>
+</div>
         <TodoFilters
           :filter="filter"
           :remaining="remaining"
