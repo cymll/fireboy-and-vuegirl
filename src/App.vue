@@ -6,13 +6,21 @@
   (same four; each one now also saves the list to localStorage as its last line)
 -->
 <script setup>
-import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
-// ADD THESE 3 LINES:
-import { doc, query, orderBy, onSnapshot, addDoc, updateDoc, deleteDoc, writeBatch, serverTimestamp } from 'firebase/firestore'
-import { db, todosCol } from './firebase'
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
+import { onAuthStateChanged, signOut } from 'firebase/auth'
+import { doc, query, where, orderBy, onSnapshot, addDoc, updateDoc, deleteDoc,
+         writeBatch, serverTimestamp } from 'firebase/firestore'
+import { db, todosCol, auth } from './firebase'
+import LoginForm from './components/LoginForm.vue'
+import TodoItem from './components/TodoItem.vue'
+import TodoFilters from './components/TodoFilters.vue'
+
+const user = ref(null)          // the real Firebase user, or null
+const authReady = ref(false)    // false until Firebase knows whether you're signed in
+
+
 
 const title = ref('My Todo List')
-const user = reactive({ name: 'Student', streak: 1 })
 
 
 // Start EMPTY. The data arrives in onMounted, just like data from a server will.
@@ -41,99 +49,144 @@ const visibleTodos = computed(() => {
 
 console.log('1. setup runs: the component is being created (not on screen yet)')
 
+let stopListening = null
+
+let stopAuth = null
+let stopTodos = null
+// don't forget!!!
+
 onMounted(() => {
-  console.log('2. onMounted: the component is on screen')
-
-  // Load the saved list (or the defaults the first time)
-  const saved = localStorage.getItem('todos')
-  todos.value = saved ? JSON.parse(saved) : DEFAULT_TODOS
-
-  // The <input> exists now, so we can focus it
-  inputEl.value.focus()
+  stopAuth = onAuthStateChanged(auth, (u) => {
+    user.value = u
+    authReady.value = true
+  })
 })
+
+// Each time the user changes, stop the old listener and start one for the new user
+watch(user, (u) => {
+  if (stopTodos) stopTodos()
+  todos.value = []
+  if (!u) return
+
+  const q = query(todosCol, where('uid', '==', u.uid), orderBy('createdAt'))
+  stopTodos = onSnapshot(
+    q,
+    (snap) => { todos.value = snap.docs.map((d) => ({ id: d.id, ...d.data() })) },
+    (err) => console.error('Could not load todos:', err.message),
+  )
+})
+
+onUnmounted(() => {
+  if (stopAuth) stopAuth()
+  if (stopTodos) stopTodos()
+})
+
+function logout() {
+  signOut(auth)   // the watch above clears the list and stops the listener
+}
 
 function addTodo() {
   if (newText.value.trim() === '') return
 
-  todos.value.push({
-    id: Date.now(),
-    text: newText.value.trim(),
-    note: newNote.value.trim(),
-    important: newImportant.value,
-    done: false,
-  })
+ const newTodo = {
+  text: newText.value.trim(),
+  note: newNote.value.trim(),
+  important: newImportant.value,
+  done: false,
+  uid: user.value.uid,          // NEW: whose todo this is
+  createdAt: serverTimestamp(),
+} 
 
   newText.value = ''
   newNote.value = ''
   newImportant.value = false
 
-  localStorage.setItem('todos', JSON.stringify(todos.value))
+  addDoc(todosCol, newTodo)
 }
 
 function toggleTodo(id) {
   const todo = todos.value.find((t) => t.id === id)
-  todo.done = !todo.done
-
-  localStorage.setItem('todos', JSON.stringify(todos.value))
+  updateDoc(doc(db, 'todos', id), { done: !todo.done })
 }
 
 function removeTodo(id) {
-  todos.value = todos.value.filter((t) => t.id !== id)
-
-  localStorage.setItem('todos', JSON.stringify(todos.value))
+  deleteDoc(doc(db, 'todos', id))
 }
+
 
 function clearDone() {
-  todos.value = todos.value.filter((t) => !t.done)
-
-  localStorage.setItem('todos', JSON.stringify(todos.value))
+  const batch = writeBatch(db)
+  todos.value
+    .filter((t) => t.done)
+    .forEach((t) => batch.delete(doc(db, 'todos', t.id)))
+  batch.commit()
 }
+
 </script>
 
 <template>
   <div class="app">
     <div class="card">
       <h1>{{ title }}</h1>
-      <p class="sub">Hello, {{ user.name }}! {{ remaining }} of {{ todos.length }} tasks left.</p>
 
-      <div class="toolbar">
-        <button class="link" @click="showTips = !showTips">
-          {{ showTips ? 'Hide' : 'Show' }} tips
-        </button>
-      </div>
-      <div v-show="showTips" class="tips">
-        Tip: refresh the page. Your tasks are still here.
-      </div>
+      <!-- 1. Firebase still checking auth -->
+      <p v-if="!authReady" class="empty">Loading…</p>
 
-      <form @submit.prevent="addTodo">
-        <div class="row">
-          <input ref="inputEl" v-model="newText" type="text" placeholder="What needs doing?" />
-          <button class="primary" type="submit" :disabled="!canAdd">Add</button>
+      <!-- 2. Signed out -->
+      <LoginForm v-else-if="!user" />
+
+      <!-- 3. Signed in: full todo UI -->
+      <template v-else>
+        <p class="sub">
+          Hello, {{ user.email }}! {{ remaining }} of {{ todos.length }} tasks left.
+          <button class="link" @click="logout">Sign out</button>
+        </p>
+
+        <div class="toolbar">
+          <button class="link" @click="showTips = !showTips">
+            {{ showTips ? 'Hide' : 'Show' }} tips
+          </button>
         </div>
-        <textarea v-model="newNote" rows="2" placeholder="Notes (optional)"></textarea>
-        <label class="check">
-          <input v-model="newImportant" type="checkbox" /> Important
-        </label>
-      </form>
+        <div v-show="showTips" class="tips">
+          Tip: refresh the page. Your tasks are still here.
+        </div>
 
-      <ul v-if="visibleTodos.length > 0" class="list">
-        <TodoItem
-          v-for="todo in visibleTodos"
-          :key="todo.id"
-          :todo="todo"
-          @toggle="toggleTodo"
-          @remove="removeTodo"
+        <form @submit.prevent="addTodo">
+          <div class="row">
+            <input
+              ref="inputEl"
+              v-model="newText"
+              type="text"
+              placeholder="What needs doing?"
+              autofocus
+            />
+            <button class="primary" type="submit" :disabled="!canAdd">Add</button>
+          </div>
+          <textarea v-model="newNote" rows="2" placeholder="Notes (optional)"></textarea>
+          <label class="check">
+            <input v-model="newImportant" type="checkbox" /> Important
+          </label>
+        </form>
+
+        <ul v-if="visibleTodos.length > 0" class="list">
+          <TodoItem
+            v-for="todo in visibleTodos"
+            :key="todo.id"
+            :todo="todo"
+            @toggle="toggleTodo"
+            @remove="removeTodo"
+          />
+        </ul>
+        <p v-else class="empty">Nothing here for "{{ filter }}".</p>
+
+        <TodoFilters
+          :filter="filter"
+          :remaining="remaining"
+          :done-count="doneCount"
+          @change-filter="filter = $event"
+          @clear-done="clearDone"
         />
-      </ul>
-      <p v-else class="empty">Nothing here for "{{ filter }}".</p>
-
-      <TodoFilters
-        :filter="filter"
-        :remaining="remaining"
-        :done-count="doneCount"
-        @change-filter="filter = $event"
-        @clear-done="clearDone"
-      />
+      </template>
     </div>
   </div>
 </template>
